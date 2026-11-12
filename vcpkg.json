@@ -1,0 +1,8 @@
+{
+  "name": "registration-cli",
+  "version-string": "1.0.0",
+  "dependencies": [
+    "tiff",
+    "eigen3"
+  ]
+}
