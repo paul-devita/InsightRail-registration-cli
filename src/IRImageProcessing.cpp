@@ -9,6 +9,7 @@
 #include <memory>
 #include <numbers>
 #include <vector>
+#include <thread>
 
 
 using namespace IRTools::ImageProcessing;
@@ -113,19 +114,22 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
     // todo: ask brennan about the scale for these
     constexpr uint32_t MAX_NN_NORMALS = 30;
     constexpr double VOXEL_SCALE_NORMALS = 2;
-    // estimate normals for each point cloud
-    source_pc.EstimateNormals(KDSearchParam(VOXEL_SCALE_NORMALS * settings.global_voxel_size, MAX_NN_NORMALS));
-    reference_pc.EstimateNormals(KDSearchParam(VOXEL_SCALE_NORMALS * settings.global_voxel_size, MAX_NN_NORMALS));
-
-    // orient the normals to point at the positive z-axis
-    source_pc.OrientNormalsToAlignWithDirection(Eigen::Vector3d::UnitZ());
-    reference_pc.OrientNormalsToAlignWithDirection(Eigen::Vector3d::UnitZ());
 
     // must be vector of shared_ptr, prevents unnecessary copying of point cloud data
     std::vector<PointCloudSP> src_levels, ref_levels;
 
     // if there are no voxel sizes provided, use full point clouds for registration
     if (settings.levels.empty()) {
+        DEBUG_LOG("warning: no levels provided, performing normal calculation on entire dataset");
+
+        // estimate normals for each point cloud, VERY EXPENSIVE
+        source_pc.EstimateNormals(KDSearchParam(VOXEL_SCALE_NORMALS * settings.global_voxel_size, MAX_NN_NORMALS), true);
+        reference_pc.EstimateNormals(KDSearchParam(VOXEL_SCALE_NORMALS * settings.global_voxel_size, MAX_NN_NORMALS), true);
+
+        // orient the normals to point at the positive z-axis
+        source_pc.OrientNormalsToAlignWithDirection(Eigen::Vector3d::UnitZ());
+        reference_pc.OrientNormalsToAlignWithDirection(Eigen::Vector3d::UnitZ());
+
         // must provide a noop destructor so shared_ptr does not deallocate stack-allocated memory
         constexpr auto noop_destructor = [](geo::PointCloud*){};
 
@@ -138,20 +142,45 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
         const size_t voxel_count = settings.levels.size();
 
         // reserve space for the point clouds
-        src_levels.reserve(voxel_count);
-        ref_levels.reserve(voxel_count);
+        src_levels.resize(voxel_count);
+        ref_levels.resize(voxel_count);
+
+        const auto processLevel = [](std::vector<PointCloudSP>& dest, const size_t i, const float voxel, const float radius_factor, const PointCloud& original_cloud,
+            const uint32_t iterations, bool is_ref) -> void {
+
+            DEBUG_LOG("REG: estimating normals for " << (is_ref ? "reference" : "source") << " level " << i << " at voxel scale " << voxel);
+
+            // calculate the downsampled point cloud
+            const PointCloudSP downsampled = original_cloud.VoxelDownSample(voxel);
+
+            // estimate the normals for the downsampled point cloud
+            downsampled->EstimateNormals(KDSearchParam(voxel * radius_factor, static_cast<int>(iterations)), true);
+
+            // set the designated index in the list to be the updated point cloud
+            dest.at(i) = downsampled;
+        };
 
         // for each voxel size, generate a point cloud and add it to the list, in order
         for (size_t i = 0; i < voxel_count; i++) {
-            const uint16_t voxel = settings.levels.at(i).voxel_size;
+            const float voxel = settings.levels.at(i).voxel_size;
 
-            // get shared_ptr to the downsampled source and target point clouds
-            const PointCloudSP src_downsampled = source_pc.VoxelDownSample(voxel);
-            const PointCloudSP tgt_downsampled = reference_pc.VoxelDownSample(voxel);
+            // spawn thread for processing the source point cloud at the current voxel level
+            DEBUG_LOG("REG: spawning thread to process source level " << i << " with voxel scale " << voxel);
+            std::thread source_thread(
+                processLevel,std::ref(src_levels), i, voxel, settings.normal_radius_factor, std::cref(source_pc), MAX_NN_NORMALS, false
+            );
+            // spawn thread for processing the reference point cloud at the current voxel level
+            DEBUG_LOG("REG: spawning thread to process refernce level " << i << " with voxel scale " << voxel);
+            std::thread reference_thread(
+                processLevel,std::ref(ref_levels), i, voxel, settings.normal_radius_factor, std::cref(reference_pc), MAX_NN_NORMALS, true
+            );
 
-            // add each downsampled point cloud to the respective lists
-            src_levels.push_back(src_downsampled);
-            ref_levels.push_back(tgt_downsampled);
+            // join the worker threads
+            if (source_thread.joinable())
+                source_thread.join();
+            if (reference_thread.joinable())
+                reference_thread.join();
+            DEBUG_LOG("REG: joined threads for level " << i);
         }
     }
 
@@ -160,19 +189,32 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
 
     switch (settings.global_mode) {
         case RGM_OFF: // no RANSAC, exceptions just ripple up to the caller
-            transform = refineTransformICP(Eigen::Matrix4d::Identity(), src_levels, ref_levels, settings);
+            DEBUG_LOG("REG: running ICP with global mode: OFF");
+            try {
+                transform = refineTransformICP(Eigen::Matrix4d::Identity(), src_levels, ref_levels, settings);
+            }
+            catch (std::exception& e) {
+                // report the error
+                std::cerr << "ICP ERROR: " << e.what() << std::endl;
+
+                // let the error ripple up
+                throw e;
+            }
             break;
         case RGM_ALWAYS: // RANSAC before ICP, exceptions just ripple up to the caller
             // perform RANSAC registration
+            DEBUG_LOG("REG: running RANSAC with global mode: ALWAYS");
             transform = globalTransformRANSAC(src_levels.at(0), ref_levels.at(0), settings);
 
             // use RANSAC registration as starting point for ICP
+            DEBUG_LOG("REG: running ICP with global mode: ALWAYS");
             transform = refineTransformICP(transform, src_levels, ref_levels, settings);
 
             break;
         case RGM_ON_FAILURE: // RANSAC only when ICP fails
             // try to perform ICP registration
             try {
+                DEBUG_LOG("REG: running ICP with global mode: ON FAILURE");
                 transform = refineTransformICP(transform, src_levels, ref_levels, settings);
             }
             catch (std::exception& e) {
@@ -193,6 +235,7 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
     }
 
     // regrid the data and return the final structure
+    DEBUG_LOG("REG: starting regrid");
     return regridHeight(source_pc, transform, grid_spec, luminance_data);
 }
 
@@ -258,6 +301,7 @@ static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>&
     const auto estimator = settings.loss_enabled ?
         reg::TransformationEstimationPointToPlane(std::make_shared<reg::HuberLoss>(reg::HuberLoss(settings.robust_scale)))
         : reg::TransformationEstimationPointToPlane();
+    DEBUG_LOG("ICP: estimator instantiated");
 
     // transform to be modified and refined
     Mat4d transform = t;
@@ -276,12 +320,13 @@ static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>&
 
         // source and target point cloud at this level
         const auto& src = *src_levels.at(i);
-        const auto& tgt = *ref_levels.at(i);
+        const auto& ref = *ref_levels.at(i);
 
         // perform ICP to get transform
+        DEBUG_LOG("ICP: running RegistrationICP for level " << i);
         const reg::RegistrationResult res = reg::RegistrationICP(
             src,
-            tgt,
+            ref,
             cd,
             transform,
             estimator,
@@ -293,7 +338,8 @@ static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>&
     }
 
     // check the ICP transform, will throw if the transform is ill-formed
-    checkIcpTransform(transform, src_levels.at(0), ref_levels.at(0), settings);
+    DEBUG_LOG("ICP: checking transform");
+    checkIcpTransform(transform, src_levels.front(), ref_levels.front(), settings);
 
     // return the refined transform
     return transform;
@@ -386,13 +432,13 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     constexpr size_t MAX_SAMPLE_COUNT = 100000;
     const size_t sample_count = (std::min)(points.size(), MAX_SAMPLE_COUNT); // amount of samples to be processed
     const double step = sample_count > 1 // constant step to get index within the points vector
-        ? static_cast<double>(points.size() - 1 / (sample_count - 1))
+        ? (static_cast<double>(points.size()) - 1) / static_cast<double>(sample_count - 1)
         : 0;
 
     // translate and add each point to moved
     for (size_t i = 0; i < sample_count; i++) {
         // get points vector index
-        const size_t index = static_cast<size_t>(i * step);
+        const auto index = static_cast<size_t>(static_cast<double>(i) * step);
 
         // get reference to the corresponding point
         const Eigen::Vector3d& point = points.at(index);
@@ -403,6 +449,7 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
         // perform the rotation and translation and add the resulting vector to the moved list/vector
         moved.emplace_back((rotation * homogeneous) + translation);
     }
+    DEBUG_LOG("CHECK ICP: added each point to transformed coordinates vector");
 
     // get the minimum correspondence distance
     uint16_t min_correspondence_distance = settings.levels.at(0).correspondence_distance;
@@ -437,6 +484,7 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     geo::KDTreeFlann tree(*reference);
 
     // for each point in moved, find the single nearest neighbor, and add it to each list only if the distance is less than the min correspondence distance
+    DEBUG_LOG("CHECK ICP: calculating nearest neighbors for each valid transformed coordinate");
     for (const Eigen::Vector3d& p : moved) {
         std::vector<int> nn_indices;
         std::vector<double> nn_distances_squared;
@@ -456,7 +504,7 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
                 const Eigen::Vector3d& ref_normal = reference->normals_.at(ref_index);
                 const Eigen::Vector3d& ref_point = reference->points_.at(ref_index);
 
-                ValidTransformedPoint vtp;
+                ValidTransformedPoint vtp{};
 
                 // populate the structure
                 vtp.point = p;
@@ -491,13 +539,14 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     std::string errors;
 
     // metrics to determine the success of ICP
+    DEBUG_LOG("CHECK ICP: calcualting ICP checking metrics");
     constexpr uint32_t MIN_POINT_COUNT = 30;
     const double fitness = sample_count > 0 // proportion of samples that have a valid correspondence
-        ? static_cast<double>(valid_points.size()) / count
+        ? static_cast<double>(valid_points.size()) / static_cast<double>(count)
         : 0;
     const double center_shift_length = shift.norm(); // normalized length of the shift
     double plane_rmse = sample_count > 0 // point-to-plane root mean squared error
-        ? std::sqrt(residual2_sum / sample_count)
+        ? std::sqrt(residual2_sum / static_cast<double>(sample_count))
         : 0.0;
     double constrain_ratio; // how well correspondences constrain the six degrees of freedom of the estimated rigid transformation
     {
@@ -552,7 +601,7 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
             ? MSG
             : ", " + MSG;
     }
-    if (angle_degrees > settings.max_angle) {
+    if (angle_degrees > settings.max_rotation_deg) {
         const std::string MSG = "rotation exceeds limit";
         should_throw = true;
         errors = errors.empty()
@@ -570,7 +619,7 @@ static bool checkBitmapIndex(const size_t i, const uint8_t* const bitmap) {
     const size_t byte = i / 8;
     const size_t bit = i % 8;
 
-    const uint8_t val = bitmap[byte] & (1 << bit);
+    const uint8_t val = bitmap[byte] & (1u << bit);
 
     return val > 0;
 }
@@ -580,8 +629,8 @@ static void setBitmapIndex(const size_t i, const bool val, uint8_t* const bitmap
     const size_t bit = i % 8;
 
     bitmap[byte] = val
-        ? bitmap[byte] | (1 << bit)
-        : bitmap[byte] & ~(1 << bit);
+        ? bitmap[byte] | (1u << bit)
+        : bitmap[byte] & ~(1u << bit);
 }
 
 static double pointCloudMedian(PointCloud& pc) {
@@ -637,13 +686,13 @@ static T bilinearInterpolation(const T* const source, const uint8_t* const bitma
     const double beta = y - std::floor(y);
 
     const double w00 = (1.0 - alpha) * (1.0 - beta);
-    const double w10 = alpha * (1.0 - beta);
-    const double w01 = (1.0 - alpha) * beta;
+    const double w01 = alpha * (1.0 - beta);
+    const double w10 = (1.0 - alpha) * beta;
     const double w11 = alpha * beta;
 
-    const size_t xlo = static_cast<size_t>(std::floor(x));
+    const auto xlo = static_cast<size_t>(std::floor(x));
     const size_t xhi = (std::min)(xlo + 1, static_cast<size_t>(grid_spec.width - 1));
-    const size_t ylo = static_cast<size_t>(std::floor(y));
+    const auto ylo = static_cast<size_t>(std::floor(y));
     const size_t yhi = (std::min)(ylo + 1, static_cast<size_t>(grid_spec.height - 1));
 
     // get indices
@@ -729,9 +778,11 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
         // set the bitmap value
         setBitmapIndex(i, true, source_bitmap.get());
     }
+    DEBUG_LOG("REGRID: reconstructed source grid and bitmap from original height data");
 
     // find the median in linear time
     const double median_z = pointCloudMedian(source);
+    DEBUG_LOG("REGRID: calculated source point cloud median");
 
     // extract rotation and translation from transformation matrix
     const Eigen::Matrix3d rotation = transform.topLeftCorner<3, 3>();
@@ -747,9 +798,8 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
     const Eigen::Matrix2d A_inv = A.inverse();
     const Eigen::Vector2d sensitivity = A_inv * b;
 
-    // maximum iterations allowed for finding the source x and y coordinates
-
     // for each destination row and column, calculate the physical XY coordinates
+    DEBUG_LOG("REGRID: starting regridding of grid size r: " << height << " x c: " << width);
     for (size_t r = 0; r < height; r++) {
         for (size_t c = 0; c < width; c++) {
             constexpr size_t MAX_ESTIMATION_ITERATIONS = 30;
@@ -775,7 +825,7 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
                     uv_physical.y() / dy
                 };
 
-                const double z_next = bilinearInterpolation<double>(source_grid.get(), source_bitmap.get(), uv, grid_spec, median_z);
+                const auto z_next = bilinearInterpolation<double>(source_grid.get(), source_bitmap.get(), uv, grid_spec, median_z);
 
                 const double z_delta = z_next - z_estimate;
                 const double movement = (std::max)(
@@ -801,48 +851,70 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
             };
 
             // check to ensure that the coordinates are inside the grid
-            const bool inside = (uv.x() >= 0 && uv.x() < grid_spec.width && uv.y() >= 0 && uv.y() < grid_spec.height);
-
-            // check to ensure that all four surrounding points are valid
             const double& x = uv.x();
             const double& y = uv.y();
-            const size_t xlo = static_cast<size_t>(std::floor(x));
-            const size_t xhi = (std::min)(xlo + 1, static_cast<size_t>(grid_spec.width - 1));
-            const size_t ylo = static_cast<size_t>(std::floor(y));
-            const size_t yhi = (std::min)(ylo + 1, static_cast<size_t>(grid_spec.height - 1));
-            const size_t i00 = ylo * grid_spec.width + xlo;
-            const size_t i01 = ylo * grid_spec.width + xhi;
-            const size_t i10 = yhi * grid_spec.width + xlo;
-            const size_t i11 = yhi * grid_spec.width + xhi;
-            const bool v00 = checkBitmapIndex(i00, source_bitmap.get());
-            const bool v01 = checkBitmapIndex(i01, source_bitmap.get());
-            const bool v10 = checkBitmapIndex(i10, source_bitmap.get());
-            const bool v11 = checkBitmapIndex(i11, source_bitmap.get());
-            const bool supported = v00 && v01 && v10 && v11;
 
-            // final point is valid only if it is inside, supported, and has converged
-            if (converged && inside && supported) {
-                const double z_sampled = bilinearInterpolation<double>(source_grid.get(), source_bitmap.get(), uv, grid_spec, median_z);
-                const double z_out =
-                    rotation(2, 0) * uv_physical.x() +
-                    rotation(2, 1) * uv_physical.y() +
-                    rotation(2, 2) * z_sampled +
-                    transform(2, 3);
-                const size_t index = c * grid_spec.width + r;
+            const bool inside =
+                grid_spec.width > 0 &&
+                grid_spec.height > 0 &&
+                std::isfinite(x) &&
+                std::isfinite(y) &&
+                x >= 0.0 &&
+                x < grid_spec.width &&
+                y >= 0.0 &&
+                y < grid_spec.height;
 
-                // save the z value to the grid
-                result.heights[index] = z_out;
-                // set the bit in the bitmap
-                setBitmapIndex(index, true, result.valid_bitmap.get());
+            // proceed to checking only if the point is inside of the grid
+            if (inside) {
+                // check to ensure that all four surrounding points are valid
+                const auto xlo = static_cast<size_t>(std::floor(x));
+                const size_t xhi = (std::min)(xlo + 1, static_cast<size_t>(grid_spec.width - 1));
+                const auto ylo = static_cast<size_t>(std::floor(y));
+                const size_t yhi = (std::min)(ylo + 1, static_cast<size_t>(grid_spec.height - 1));
+
+                // indices into the source grid
+                const size_t i00 = ylo * grid_spec.width + xlo;
+                const size_t i01 = ylo * grid_spec.width + xhi;
+                const size_t i10 = yhi * grid_spec.width + xlo;
+                const size_t i11 = yhi * grid_spec.width + xhi;
+
+                // ensure that every source pixel value is actually valid in the original grid
+                const bool v00 = checkBitmapIndex(i00, source_bitmap.get());
+                const bool v01 = checkBitmapIndex(i01, source_bitmap.get());
+                const bool v10 = checkBitmapIndex(i10, source_bitmap.get());
+                const bool v11 = checkBitmapIndex(i11, source_bitmap.get());
+
+                // only supported when all four are true
+                const bool supported = v00 && v01 && v10 && v11;
+
+                // final point is valid only if it is inside, supported, and has converged
+                if (converged && supported) {
+                    const auto z_sampled = bilinearInterpolation<double>(source_grid.get(), source_bitmap.get(), uv, grid_spec, median_z);
+
+                    const double z_out =
+                        rotation(2, 0) * uv_physical.x() +
+                        rotation(2, 1) * uv_physical.y() +
+                        rotation(2, 2) * z_sampled +
+                        transform(2, 3);
+
+                    const size_t index = r * grid_spec.width + c;
+
+                    // save the z value to the grid
+                    result.heights[index] = z_out;
+
+                    // set the bit in the bitmap
+                    setBitmapIndex(index, true, result.valid_bitmap.get());
+                }
             }
 
             // populate luminance buffer if it is valid
             if (result.luminance_valid) {
-                const uint8_t intensity = bilinearInterpolation<uint8_t>(luminance_data.data, luminance_data.valid_map, uv, grid_spec, 0);
-                result.luminance[c * width + r] = intensity;
+                const auto intensity = bilinearInterpolation<uint8_t>(luminance_data.data, luminance_data.valid_map, uv, grid_spec, 0);
+                result.luminance[r * width + c] = intensity;
             }
         }
     }
+    DEBUG_LOG("REGRID: regridding finished");
 
     return result;
 }

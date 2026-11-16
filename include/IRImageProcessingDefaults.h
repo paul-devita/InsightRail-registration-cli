@@ -41,6 +41,6 @@ const RegistrationSettings LJS8DefaultSettings = {
     .max_plane_rmse = 15.0,
     .max_center_shift = 500.0,
     .max_rotation_deg = 1.0,
-    .min_constraint_ratio = 1e-10,
+    .min_constraint_ratio = 1e-15,
     .global_mode = RGM_OFF
 };

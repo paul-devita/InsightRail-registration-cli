@@ -8,6 +8,20 @@
 #include <vector>
 #include <variant>
 
+#ifdef IRTOOLS_IP_ENABLE_DEBUG_LOG
+    #include <iostream>
+    #include <syncstream>
+
+    #define DEBUG_LOG(...) \
+        do { \
+            std::osyncstream(std::cout) \
+                << "[DEBUG] " << __VA_ARGS__ << '\n'; \
+        } while (false)
+#else
+    #define DEBUG_LOG(...) ((void)0)
+#endif
+
+
 namespace IRTools::ImageProcessing
 {
 
@@ -69,7 +83,6 @@ struct RegistrationSettings { // todo: add mask?
     float max_center_shift;
     float max_rotation_deg;
     float min_constraint_ratio;
-    float max_angle;
     RegistrationGlobalMode global_mode;
     RegistrationInterpolationMode interpolation_mode;
 };

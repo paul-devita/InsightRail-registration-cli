@@ -54,34 +54,77 @@ project(registration_cli LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# download open3d
-#-----------------------------------------------------------------------------------------------------------------------
+# download open3d (Debug / Release)
+# ------------------------------------------------------------
 if(NOT WIN32)
     message(FATAL_ERROR
             "This Open3D setup currently supports Windows x64 only."
     )
 endif()
 
+# These prebuilt Open3D packages contain one build variant each.
+# Use separate single-config build directories (e.g. Ninja).
+get_property(IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+
+if(IS_MULTI_CONFIG)
+    message(FATAL_ERROR
+            "Use a single-config generator such as Ninja with "
+            "separate Debug and Release build directories."
+    )
+endif()
+
+# Default to Debug if not specified
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Debug" CACHE STRING
+            "Build configuration" FORCE)
+endif()
+
 set(OPEN3D_VERSION "0.20.0")
 
+# Select package based on compilation configuration
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+
+    set(OPEN3D_VARIANT "debug")
+    set(OPEN3D_ARCHIVE_SUFFIX "-dbg")
+    set(OPEN3D_SHA256
+            "e4c5e04669f80c9464f2fcab61cea78ab9c18080e94091b7fcb24c53b8c87801"
+    )
+
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release"
+        OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+
+    set(OPEN3D_VARIANT "release")
+    set(OPEN3D_ARCHIVE_SUFFIX "")
+    set(OPEN3D_SHA256
+            "ae2843b64da4d82e0cabf82462a9fda12921ea5be9a9d593f14a7a21a44a97fe"
+    )
+
+else()
+    message(FATAL_ERROR
+            "Unsupported build configuration: ${CMAKE_BUILD_TYPE}"
+    )
+endif()
+
+message(STATUS
+        "Building ${CMAKE_BUILD_TYPE} with ${OPEN3D_VARIANT} Open3D"
+)
+
+# Archive information
 set(OPEN3D_ARCHIVE_NAME
-        "open3d-devel-windows-amd64-${OPEN3D_VERSION}-dbg.zip"
+        "open3d-devel-windows-amd64-${OPEN3D_VERSION}${OPEN3D_ARCHIVE_SUFFIX}.zip"
 )
 
 set(OPEN3D_URL
         "https://github.com/isl-org/Open3D/releases/download/v${OPEN3D_VERSION}/${OPEN3D_ARCHIVE_NAME}"
 )
 
-set(OPEN3D_SHA256
-        "e4c5e04669f80c9464f2fcab61cea78ab9c18080e94091b7fcb24c53b8c87801"
-)
-
+# Directories
 set(OPEN3D_DOWNLOAD_DIR
         "${CMAKE_BINARY_DIR}/_deps/downloads"
 )
 
 set(OPEN3D_ROOT
-        "${CMAKE_BINARY_DIR}/_deps/open3d-${OPEN3D_VERSION}-debug"
+        "${CMAKE_BINARY_DIR}/_deps/open3d-${OPEN3D_VERSION}-${OPEN3D_VARIANT}"
 )
 
 set(OPEN3D_ARCHIVE
@@ -90,7 +133,7 @@ set(OPEN3D_ARCHIVE
 
 file(MAKE_DIRECTORY "${OPEN3D_DOWNLOAD_DIR}")
 
-# download once, and verify the cached archive.
+# Download and verify (reuses a valid cached archive)
 file(DOWNLOAD
         "${OPEN3D_URL}"
         "${OPEN3D_ARCHIVE}"
@@ -103,21 +146,20 @@ file(DOWNLOAD
 list(GET _download_status 0 _download_code)
 list(GET _download_status 1 _download_message)
 
-# ensure download succeeded
 if(NOT _download_code EQUAL 0)
     message(FATAL_ERROR
             "Open3D download failed: ${_download_message}"
     )
 endif()
 
+# Check whether the package is already extracted
 file(GLOB_RECURSE OPEN3D_CONFIG_FILES
-    LIST_DIRECTORIES FALSE
-    "${OPEN3D_ROOT}/Open3DConfig.cmake"
+        LIST_DIRECTORIES FALSE
+        "${OPEN3D_ROOT}/Open3DConfig.cmake"
 )
 
-# extract only when the expected package is absent.
 if(NOT OPEN3D_CONFIG_FILES)
-    message(STATUS "Extracting Open3D...")
+    message(STATUS "Extracting ${OPEN3D_VARIANT} Open3D...")
 
     file(MAKE_DIRECTORY "${OPEN3D_ROOT}")
 
@@ -126,18 +168,19 @@ if(NOT OPEN3D_CONFIG_FILES)
             DESTINATION "${OPEN3D_ROOT}"
     )
 
-    # search again after extraction
+    # Search again after extraction
     file(GLOB_RECURSE OPEN3D_CONFIG_FILES
             LIST_DIRECTORIES FALSE
             "${OPEN3D_ROOT}/Open3DConfig.cmake"
     )
 endif()
 
-# ensure we found exactly one configuration
+# Validate configuration discovery
 list(LENGTH OPEN3D_CONFIG_FILES OPEN3D_CONFIG_COUNT)
+
 if(OPEN3D_CONFIG_COUNT EQUAL 0)
     message(FATAL_ERROR
-            "Open3DConfig.cmake not found anywhere under ${OPEN3D_ROOT}"
+            "Open3DConfig.cmake not found under ${OPEN3D_ROOT}"
     )
 elseif(OPEN3D_CONFIG_COUNT GREATER 1)
     message(FATAL_ERROR
@@ -145,18 +188,24 @@ elseif(OPEN3D_CONFIG_COUNT GREATER 1)
     )
 endif()
 
-# retrieve the actual config file
+# Get actual configuration path
 list(GET OPEN3D_CONFIG_FILES 0 OPEN3D_CONFIG_FILE)
 
-# get its containing directory
 get_filename_component(OPEN3D_CONFIG_DIR
         "${OPEN3D_CONFIG_FILE}" DIRECTORY
 )
 
-# tell cmake exactly where it is
-set(Open3D_DIR "${OPEN3D_CONFIG_DIR}")
+# Set package path for find_package()
+set(Open3D_DIR "${OPEN3D_CONFIG_DIR}"
+        CACHE PATH "Open3D configuration directory" FORCE
+)
 
-message(STATUS "Found Open3D config: ${OPEN3D_CONFIG_FILE}")
+message(STATUS
+        "Found ${OPEN3D_VARIANT} Open3D config: ${Open3D_DIR}"
+)
+
+# Locate Open3D
+find_package(Open3D CONFIG REQUIRED)
 
 # find dependencies
 #-----------------------------------------------------------------------------------------------------------------------
@@ -183,6 +232,15 @@ add_executable(registration_cli
         ${SOURCES}
         ${HEADERS}
 )
+
+# set to ON to enable debug messages in ImageProcessing functionalities
+option(ENABLE_DEBUG_LOG "Enable debug logging" ON)
+
+if (ENABLE_DEBUG_LOG)
+    target_compile_definitions(registration_cli
+            PRIVATE IRTOOLS_IP_ENABLE_DEBUG_LOG
+    )
+endif ()
 
 target_link_libraries(registration_cli PRIVATE
         TIFF::TIFF

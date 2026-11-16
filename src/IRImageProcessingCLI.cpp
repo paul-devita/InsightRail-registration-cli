@@ -269,7 +269,7 @@ static Command processCommand(std::string_view input) {
             .referenceHeightPath = tokens[3].text,
             .lumPath = tokens.size() == 5
                 ? std::optional<std::string>{tokens[4].text}
-            : std::nullopt
+                : std::nullopt
     };
 
         return {
@@ -302,11 +302,13 @@ static void runCommand(const Command& command) {
         case CommandType::RegisterFolder:
         case CommandType::RegisterSingle:
             const auto& args = std::get<RegistrationArguments>(command.arguments);
+            DEBUG_LOG("CLI: calling register single");
             registerSingle(
                 args.heightPath,
                 args.referenceHeightPath,
                 args.lumPath
             );
+            DEBUG_LOG("CLI: register single returned");
             break;
     }
 }
@@ -430,7 +432,6 @@ void printSettings(const RegistrationSettings& settings_, std::ostream& out) {
     row("Maximum center shift", settings_.max_center_shift);
     row("Maximum rotation (deg)", settings_.max_rotation_deg);
     row("Minimum constraint ratio", settings_.min_constraint_ratio);
-    row("Maximum angle", settings_.max_angle);
 
     text << "\nOutput\n";
     row("Interpolation mode (enum value)",
@@ -446,16 +447,10 @@ static void registerSingle(std::string source, std::string reference, const std:
         .luminance = luminance == std::nullopt
             ? ""
             : luminance.value(),
-        .luminance_valid = luminance == std::nullopt
+        .luminance_valid = luminance != std::nullopt
     };
 
     const auto result = registerSingleCloud(input, settings);
-
-    // save tiff image
-    if (input.luminance_valid) {
-        std::string saved_name = "REGISTERED_" + source;
-        IRTools::tiff::saveTiff8Bit(saved_name, result.luminance.get(), result.height, result.width);
-    }
 
     // todo: ask brennan how he wants the heights represented since at this point they are decimal values
 }
