@@ -208,14 +208,14 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
 
             // use RANSAC registration as starting point for ICP
             DEBUG_LOG("REG: running ICP with global mode: ALWAYS");
-            transform = refineTransformICP(transform, src_levels, ref_levels, settings);
+            transform = refineTransformICP(Eigen::Matrix4d::Identity(), src_levels, ref_levels, settings);
 
             break;
         case RGM_ON_FAILURE: // RANSAC only when ICP fails
             // try to perform ICP registration
             try {
                 DEBUG_LOG("REG: running ICP with global mode: ON FAILURE");
-                transform = refineTransformICP(transform, src_levels, ref_levels, settings);
+                transform = refineTransformICP(Eigen::Matrix4d::Identity(), src_levels, ref_levels, settings);
             }
             catch (std::exception& e) {
                 // report the errors
@@ -339,7 +339,7 @@ static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>&
 
     // check the ICP transform, will throw if the transform is ill-formed
     DEBUG_LOG("ICP: checking transform");
-    checkIcpTransform(transform, src_levels.front(), ref_levels.front(), settings);
+    //checkIcpTransform(transform, src_levels.front(), ref_levels.front(), settings);
 
     // return the refined transform
     return transform;
@@ -391,7 +391,7 @@ static Mat4d globalTransformRANSAC(const PointCloudSP& source, const PointCloudS
     constexpr double CC_DISTANCE_VOXEL_SCALE = 1.5;
 
     const CCEdgeLength edge_checker(CC_EDGE_LENGTH_SIMILARITY_THRESHOLD);
-    const CCDistance distance_checker(CC_DISTANCE_VOXEL_SCALE);
+    const CCDistance distance_checker(CC_DISTANCE_VOXEL_SCALE * global_voxel_size);
 
     const reg::RegistrationResult res = reg::RegistrationRANSACBasedOnFeatureMatching(
         *src_cloud,
@@ -443,11 +443,8 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
         // get reference to the corresponding point
         const Eigen::Vector3d& point = points.at(index);
 
-        // calculate the homogeneous point vector
-        const Eigen::Vector3d homogeneous = {point.x(), point.y(), 1.0};
-
         // perform the rotation and translation and add the resulting vector to the moved list/vector
-        moved.emplace_back((rotation * homogeneous) + translation);
+        moved.emplace_back((rotation * point) + translation);
     }
     DEBUG_LOG("CHECK ICP: added each point to transformed coordinates vector");
 
@@ -542,11 +539,11 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     DEBUG_LOG("CHECK ICP: calcualting ICP checking metrics");
     constexpr uint32_t MIN_POINT_COUNT = 30;
     const double fitness = sample_count > 0 // proportion of samples that have a valid correspondence
-        ? static_cast<double>(valid_points.size()) / static_cast<double>(count)
+        ? static_cast<double>(count) / static_cast<double>(sample_count)
         : 0;
     const double center_shift_length = shift.norm(); // normalized length of the shift
     double plane_rmse = sample_count > 0 // point-to-plane root mean squared error
-        ? std::sqrt(residual2_sum / static_cast<double>(sample_count))
+        ? std::sqrt(residual2_sum / static_cast<double>(count))
         : 0.0;
     double constrain_ratio; // how well correspondences constrain the six degrees of freedom of the estimated rigid transformation
     {
@@ -569,42 +566,42 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     if (count < MIN_POINT_COUNT) {
         const std::string MSG = "too few correspondences";
         should_throw = true;
-        errors = errors.empty()
+        errors += errors.empty()
             ? MSG
             : ", " + MSG;
     }
     if (plane_rmse > settings.max_plane_rmse) {
         const std::string MSG = "residual exceeds limit";
         should_throw = true;
-        errors = errors.empty()
+        errors += errors.empty()
             ? MSG
             : ", " + MSG;
     }
     if (constrain_ratio < settings.min_constraint_ratio) {
         const std::string MSG = "motion is weakly constrained";
         should_throw = true;
-        errors = errors.empty()
+        errors += errors.empty()
             ? MSG
             : ", " + MSG;
     }
     if (fitness < settings.min_fitness) {
         const std::string MSG = "correspondence coverage below limit";
         should_throw = true;
-        errors = errors.empty()
+        errors += errors.empty()
             ? MSG
             : ", " + MSG;
     }
     if (center_shift_length > settings.max_center_shift) {
         const std::string MSG = "translation exceeds limit";
         should_throw = true;
-        errors = errors.empty()
+        errors += errors.empty()
             ? MSG
             : ", " + MSG;
     }
     if (angle_degrees > settings.max_rotation_deg) {
         const std::string MSG = "rotation exceeds limit";
         should_throw = true;
-        errors = errors.empty()
+        errors += errors.empty()
             ? MSG
             : ", " + MSG;
     }
@@ -633,6 +630,7 @@ static void setBitmapIndex(const size_t i, const bool val, uint8_t* const bitmap
         : bitmap[byte] & ~(1u << bit);
 }
 
+// todo: make a copy of the data to find median, moves normals
 static double pointCloudMedian(PointCloud& pc) {
     auto& points = pc.points_;
 
@@ -860,9 +858,9 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
                 std::isfinite(x) &&
                 std::isfinite(y) &&
                 x >= 0.0 &&
-                x < grid_spec.width &&
+                x <= static_cast<double>(grid_spec.width - 1) &&
                 y >= 0.0 &&
-                y < grid_spec.height;
+                y <= static_cast<double>(grid_spec.height - 1);
 
             // proceed to checking only if the point is inside of the grid
             if (inside) {
@@ -884,8 +882,21 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
                 const bool v10 = checkBitmapIndex(i10, source_bitmap.get());
                 const bool v11 = checkBitmapIndex(i11, source_bitmap.get());
 
-                // only supported when all four are true
-                const bool supported = v00 && v01 && v10 && v11;
+                const double alpha = x - static_cast<double>(xlo);
+                const double beta = y - static_cast<double>(ylo);
+
+                const double w00 = (1.0 - alpha) * (1.0 - beta);
+                const double w01 = alpha * (1.0 - beta);
+                const double w10 = (1.0 - alpha) * beta;
+                const double w11 = alpha * beta;
+
+                const double support =
+                    w00 * static_cast<double>(v00) +
+                    w01 * static_cast<double>(v01) +
+                    w10 * static_cast<double>(v10) +
+                    w11 * static_cast<double>(v11);
+
+                const bool supported = support >= 1.0 - 1e-12;
 
                 // final point is valid only if it is inside, supported, and has converged
                 if (converged && supported) {

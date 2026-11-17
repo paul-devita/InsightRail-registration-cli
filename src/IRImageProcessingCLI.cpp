@@ -16,7 +16,7 @@
 
 #include "TiffOperations.h"
 
-#define VERSION "v0.1"
+#define VERSION "v1.0"
 
 /*
 COMMANDS:
@@ -40,6 +40,7 @@ namespace {
     enum class CommandType {
         Help,
         Exit,
+        Test,
         SettingsView,
         SettingsSet,
         SettingsDefault,
@@ -64,11 +65,16 @@ namespace {
         std::optional<std::string> lumPath;
     };
 
+    struct TestArguments {
+        std::string heightPath;
+    };
+
     struct Command {
         CommandType type;
         std::variant<std::monostate, SettingAssignment,
-            ImportArguments, RegistrationArguments> arguments;
+            ImportArguments, RegistrationArguments, TestArguments> arguments;
     };
+
 }
 static std::vector<Token> parseTokens(std::string_view input);
 static Command processCommand(std::string_view input);
@@ -76,7 +82,8 @@ static void runCommand(const Command& command);
 
 static void printHelp(std::ostream& out = std::cout);
 static void printSettings(const RegistrationSettings& settings_, std::ostream& out = std::cout);
-static void registerSingle(std::string source, std::string reference, const std::optional<std::string>& luminance);
+static RegistrationResult registerSingle(std::string source, std::string reference, const std::optional<std::string>& luminance);
+static void testSingle(const std::string& reference);
 
 static IRTools::ImageProcessing::RegistrationSettings settings = LJS8DefaultSettings;
 
@@ -214,6 +221,11 @@ static Command processCommand(std::string_view input) {
         return {CommandType::Exit, std::monostate{}};
     }
 
+    if (tokens[0].text == "test") {
+        require(tokens.size() == 2, "Usage: test <height_path>");
+        return {CommandType::Test, TestArguments{tokens[1].text}};
+    }
+
     if (tokens[0].text == "settings") {
         require(tokens.size() >= 2, "Usage: settings <subcommand>");
 
@@ -290,6 +302,12 @@ static void runCommand(const Command& command) {
         case CommandType::Exit:
             std::exit(0);
             break;
+        case CommandType::Test: {
+            const auto& args = std::get<TestArguments>(command.arguments);
+            DEBUG_LOG("CLI: running test on " << args.heightPath);
+            testSingle(args.heightPath);
+            break;
+        }
         case CommandType::SettingsView:
             printSettings(settings);
             break;
@@ -300,7 +318,7 @@ static void runCommand(const Command& command) {
         case CommandType::SettingsImport:
         case CommandType::SettingsExport:
         case CommandType::RegisterFolder:
-        case CommandType::RegisterSingle:
+        case CommandType::RegisterSingle: {
             const auto& args = std::get<RegistrationArguments>(command.arguments);
             DEBUG_LOG("CLI: calling register single");
             registerSingle(
@@ -310,6 +328,7 @@ static void runCommand(const Command& command) {
             );
             DEBUG_LOG("CLI: register single returned");
             break;
+        }
     }
 }
 
@@ -440,7 +459,7 @@ void printSettings(const RegistrationSettings& settings_, std::ostream& out) {
     out << text.str();
 }
 
-static void registerSingle(std::string source, std::string reference, const std::optional<std::string>& luminance) {
+static RegistrationResult registerSingle(std::string source, std::string reference, const std::optional<std::string>& luminance) {
     LJS8Input input = {
         .source = std::move(source),
         .reference = std::move(reference),
@@ -450,7 +469,220 @@ static void registerSingle(std::string source, std::string reference, const std:
         .luminance_valid = luminance != std::nullopt
     };
 
-    const auto result = registerSingleCloud(input, settings);
+    return registerSingleCloud(input, settings);
 
     // todo: ask brennan how he wants the heights represented since at this point they are decimal values
+}
+
+static bool checkBitmapIndex(const size_t i, const uint8_t* const bitmap) {
+    const size_t byte = i / 8;
+    const size_t bit = i % 8;
+
+    const uint8_t val = bitmap[byte] & (1u << bit);
+
+    return val > 0;
+}
+
+static void setBitmapIndex(const size_t i, const bool val, uint8_t* const bitmap) {
+    const size_t byte = i / 8;
+    const size_t bit = i % 8;
+
+    bitmap[byte] = val
+        ? bitmap[byte] | (1u << bit)
+        : bitmap[byte] & ~(1u << bit);
+}
+
+void testSingle(const std::string &reference) {
+    struct HeightData {
+        uint32_t width;
+        uint32_t height;
+        std::unique_ptr<uint16_t[]> data;
+        std::unique_ptr<double[]> scaled_data;
+        std::vector<bool> valid_bitmap;
+    } reference_data{};
+
+    // open the source file
+    IRTools::tiff::loadTiff16Bit(reference, reference_data.data, reference_data.width, reference_data.height);
+
+    // allocate required bitmap elements
+    reference_data.valid_bitmap.resize(reference_data.width * reference_data.height);
+
+    // get height scale and height zero
+    const double height_scale = std::get<IRTools::ImageProcessing::LJS8Settings>(settings.device_settings).height_scale;
+    const double height_zero = std::get<IRTools::ImageProcessing::LJS8Settings>(settings.device_settings).height_zero;
+
+    // populate source bitmap and scaled data
+    for (size_t i = 0; i < reference_data.width * reference_data.height; i++)
+        // if the data value is non-zero, set it as valid within the bitmap
+        if (reference_data.data[i] != 0)
+            reference_data.valid_bitmap.at(i) = true;
+
+    struct ShiftAmount {
+        size_t sx;
+        size_t sy;
+    };
+
+    // test params
+    constexpr size_t SHIFTS_NUM = 1;
+    constexpr std::array<ShiftAmount, SHIFTS_NUM> shifts = {
+        ShiftAmount{.sx = 0, .sy = 0}
+    };
+
+    // print test params
+    std::cout << "TEST: testing input \'" << reference << "\' on shift amounts: [";
+    for (size_t i = 0; i < SHIFTS_NUM; i++) {
+        if (i > 0) std::cout << " ";
+        std::cout << "(" << shifts[i].sx << "," << shifts[i].sy << ")";
+        if (i < SHIFTS_NUM - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+
+    // metrics for test
+    double sum_rmse_scaled = 0.0;
+    double min_rmse_scaled = std::numeric_limits<double>::infinity();
+    double max_rmse_scaled = -std::numeric_limits<double>::infinity();
+    double sum_rmse_unscaled = 0.0;
+    double min_rmse_unscaled = std::numeric_limits<double>::infinity();
+    double max_rmse_unscaled = -std::numeric_limits<double>::infinity();
+    uint32_t mismatched_points = 0;
+
+    // buffer for shifted data
+    bool is_clean = true;
+    const size_t size = reference_data.width * reference_data.height;
+    std::unique_ptr<uint16_t[]> shifted = std::make_unique<uint16_t[]>(size);
+
+    // run each test
+    for (const auto& shift : shifts) {
+        // clear the shifted buffer if it is dirty
+        if (is_clean)
+            is_clean = false;
+        else
+            memset(shifted.get(), 0, size * sizeof(uint16_t));
+
+        const size_t dx = shift.sx;
+        const size_t dy = shift.sy;
+
+        // populate the shifted buffer according to the shift
+        for (size_t y = 0; y < reference_data.height; y++) {
+            for (size_t x = 0; x < reference_data.width; x++) {
+                const size_t xdest = x + dx;
+                const size_t ydest = y + dy;
+
+                // if the shifted data is in bounds, save it to the shifted buffer
+                if (xdest < reference_data.width && ydest < reference_data.height) {
+                    const size_t dest_index = ydest * reference_data.width + xdest;
+                    const size_t src_index = y * reference_data.width + x;
+
+                    shifted[dest_index] = reference_data.data[src_index];
+                }
+            }
+        }
+
+        // save the shifted heightmap to disk
+        const std::string shifted_path = "shifted_temp.tiff";
+        IRTools::tiff::saveTiff16Bit(shifted_path, shifted.get(), reference_data.height, reference_data.width);
+
+        // run registration using the shift as the source
+        const auto result = registerSingle(shifted_path, reference, std::nullopt);
+
+        // ensure that the image dimensions match up
+        if (bool width_mismatch = result.width != reference_data.width, height_mismatch = result.height != reference_data.height;
+            width_mismatch || height_mismatch) {
+            std::cout << "TEST ERROR: " <<
+                (width_mismatch
+                ? (height_mismatch
+                    ? "result width and height do not match with source image width and height"
+                    : "result height does not match with source image height")
+                : "result width does not match with source image width")
+            << std::endl;
+            return;
+        }
+
+        // sums of rmse for scaled and unscaled values
+        double se_scaled = 0.0;
+        double se_unscaled = 0.0;
+        uint32_t n = 0;
+        uint32_t matched = 0;
+
+        // buffer to save for testing
+        std::unique_ptr<uint16_t[]> buff = std::make_unique<uint16_t[]>(size);
+
+        // check each valid data point, taking note of any data points whose validness doesn't match
+        for (size_t i = 0; i < size; i++) {
+            const bool source_valid = reference_data.valid_bitmap.at(i);
+            const bool shifted_valid = checkBitmapIndex(i, result.valid_bitmap.get());
+
+            if (shifted_valid) {
+                const double shifted_scaled = result.heights[i];
+                const auto shifted_unscaled = static_cast<uint16_t>(std::round(shifted_scaled / height_scale + height_zero));
+
+                buff[i] = shifted_unscaled;
+            }
+
+            if (source_valid == shifted_valid)
+                matched++;
+            else
+                mismatched_points++;
+
+            if (source_valid && shifted_valid) {
+                n++;
+
+                const uint16_t source_unscaled = reference_data.data[i];
+                const double source_scaled = (static_cast<double>(source_unscaled) - height_zero) * height_scale;
+
+                const double shifted_scaled = result.heights[i];
+                const auto shifted_unscaled = static_cast<uint16_t>(std::round(shifted_scaled / height_scale + height_zero));
+
+                const double diff_unscaled = shifted_unscaled - source_unscaled;
+                const double diff_scaled = shifted_scaled - source_scaled;
+
+                se_unscaled += diff_unscaled * diff_unscaled;
+                se_scaled += diff_scaled * diff_scaled;
+            }
+        }
+
+        double rmse_scaled = std::sqrt(se_scaled / static_cast<double>(n));
+        double rmse_unscaled = std::sqrt(se_unscaled / static_cast<double>(n));
+
+        // update min rmse
+        if (rmse_scaled < min_rmse_scaled) min_rmse_scaled = rmse_scaled;
+        if (rmse_unscaled < min_rmse_unscaled) min_rmse_unscaled = rmse_unscaled;
+
+        // update max rmse
+        if (rmse_scaled > max_rmse_scaled) max_rmse_scaled = rmse_scaled;
+        if (rmse_unscaled > max_rmse_unscaled) max_rmse_unscaled = rmse_unscaled;
+
+        // update rmse sum
+        sum_rmse_scaled += rmse_scaled;
+        sum_rmse_unscaled += rmse_unscaled;
+
+        IRTools::tiff::saveTiff16Bit("height_out_temp.tiff", buff.get(), reference_data.height, reference_data.width);
+
+        DEBUG_LOG("TEST: done with test for shift (" << shift.sx << "," << shift.sy << "), got " << n << " matched points and scaled RMSE " << rmse_scaled << " and unscaled RMSE " << rmse_unscaled);
+    }
+
+    // print results
+    std::cout << std::fixed << std::setprecision(6);
+
+    std::cout << "\n========== REGISTRATION RMSE STATISTICS ==========\n";
+
+    std::cout << std::left << std::setw(15) << "Metric"
+              << std::right << std::setw(18) << "Scaled"
+              << std::setw(18) << "Unscaled" << '\n';
+
+    std::cout << std::string(51, '-') << '\n';
+
+        std::cout << std::left << std::setw(15) << "Average RMSE"
+                  << std::right << std::setw(18) << sum_rmse_scaled / SHIFTS_NUM
+                  << std::setw(18) << sum_rmse_unscaled / SHIFTS_NUM << '\n';
+
+        std::cout << std::left << std::setw(15) << "Minimum RMSE"
+                  << std::right << std::setw(18) << min_rmse_scaled
+                  << std::setw(18) << min_rmse_unscaled << '\n';
+
+        std::cout << std::left << std::setw(15) << "Maximum RMSE"
+                  << std::right << std::setw(18) << max_rmse_scaled
+                  << std::setw(18) << max_rmse_unscaled << '\n';
+
+    std::cout << "==================================================\n";
 }
