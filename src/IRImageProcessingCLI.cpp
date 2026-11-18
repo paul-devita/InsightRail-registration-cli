@@ -390,7 +390,7 @@ void printSettings(const RegistrationSettings& settings_, std::ostream& out) {
     text << "REGISTRATION SETTINGS\n\n";
 
     text << "Device\n";
-    if (settings_.type == DeviceType::LJS8_LASER) {
+    if (settings_.device_type == DeviceType::DT_LJS8_LASER) {
         row("Type", "LASER");
 
         if (const auto* laser = std::get_if<LJS8Settings>(&settings_.device_settings)) {
@@ -523,9 +523,12 @@ void testSingle(const std::string &reference) {
     };
 
     // test params
-    constexpr size_t SHIFTS_NUM = 1;
+    constexpr size_t SHIFTS_NUM = 4;
     constexpr std::array<ShiftAmount, SHIFTS_NUM> shifts = {
-        ShiftAmount{.sx = 0, .sy = 0}
+        ShiftAmount{.sx = 0, .sy = 0},
+        ShiftAmount{.sx = 0, .sy = 10},
+        ShiftAmount{.sx = 10, .sy = 0},
+        ShiftAmount{.sx = 10, .sy = 10}
     };
 
     // print test params
@@ -628,7 +631,7 @@ void testSingle(const std::string &reference) {
                 n++;
 
                 const uint16_t source_unscaled = reference_data.data[i];
-                const double source_scaled = (static_cast<double>(source_unscaled) - height_zero) * height_scale;
+                const double source_scaled = (static_cast<double>(source_unscaled) - static_cast<double>(height_zero)) * height_scale;
 
                 const double shifted_scaled = result.heights[i];
                 const auto shifted_unscaled = static_cast<uint16_t>(std::round(shifted_scaled / height_scale + height_zero));

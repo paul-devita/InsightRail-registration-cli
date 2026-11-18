@@ -31,53 +31,54 @@ namespace geo = open3d::geometry;
 enum RegistrationGlobalMode {
     RGM_OFF, // no global registration (RANSAC) is used
     RGM_ALWAYS, // RANSAC is used before ICP
-    RGM_ON_FAILURE // RANSAC is only used when ICP fails
+    RGM_ON_FAILURE, // RANSAC is only used when ICP fails
+    RGM_COUNT
 };
 
 enum RegistrationInterpolationMode {
     RIM_LINEAR,
-    RIM_NEAREST
+    RIM_NEAREST,
+    RIM_COUNT
 };
 
 enum DeviceType {
-    LJS8_LASER
+    DT_LJS8_LASER
 };
 
 struct LJS8Settings {
-    uint16_t x_raw_pixel_spacing; // size of non-skipped pixel spacing in um
-    uint16_t y_raw_pixel_spacing; // in other words, the highest image resolution possible
+    double x_raw_pixel_spacing; // size of non-skipped pixel spacing in um
+    double y_raw_pixel_spacing; // in other words, the highest image resolution possible
     uint8_t lx_skip;
     uint8_t ly_skip;
     uint8_t ux_skip;
     uint8_t uy_skip;
-    uint32_t height_zero;
-    float height_scale;
+    double height_zero;
+    double height_scale;
     std::vector<uint16_t> invalid_values;
 };
 
 using DeviceSettings =  std::variant<LJS8Settings>;
 
 struct RegistrationLevelSettings {
-    uint16_t voxel_size; // voxel sizes in um
-    uint16_t correspondence_distance; // correspondence distance in um
+    double voxel_size; // voxel sizes in um
+    double correspondence_distance; // correspondence distance in um
     uint16_t max_iterations;
 };
 
 struct RegistrationSettings { // todo: add mask?
-    DeviceType type;
+    DeviceType device_type;
     DeviceSettings device_settings;
-    uint16_t x_pixel_size; // overwritten by device settings
-    uint16_t y_pixel_size; // overwritten by device settings
+    double x_pixel_size; // overwritten by device settings
+    double y_pixel_size; // overwritten by device settings
     std::vector<RegistrationLevelSettings> levels; // leave empty for no downsampling/levels
     float relative_fitness;
     float relative_rmse;
     float normal_radius_factor;
-    float robust_scale; // loss
-    bool loss_enabled;
+    std::optional<double> robust_scale; // loss
     float global_voxel_size;
     uint32_t ransac_iterations;
     float ransac_confidence;
-    uint32_t random_seed;
+    int random_seed;
     float min_fitness;
     float max_plane_rmse;
     float max_center_shift;
@@ -85,6 +86,7 @@ struct RegistrationSettings { // todo: add mask?
     float min_constraint_ratio;
     RegistrationGlobalMode global_mode;
     RegistrationInterpolationMode interpolation_mode;
+    uint32_t min_point_count;
 };
 
 struct LJS8Input {
@@ -109,5 +111,10 @@ geo::PointCloud smoothSingleCloud(const geo::PointCloud& source, uint32_t size, 
 
 RegistrationResult registerSingleCloud(const RegistrationInput& input, RegistrationSettings& settings);
 
+
+class RegistrationLJS8SettingsError : public std::runtime_error { public: explicit RegistrationLJS8SettingsError(const std::string& msg) : std::runtime_error(msg) {} };
+class RegistrationLJS8DataError : public std::runtime_error { public: explicit RegistrationLJS8DataError(const std::string& msg) : std::runtime_error(msg) {} };
+class RegistrationInputError : public std::runtime_error { public: explicit RegistrationInputError(const std::string& msg) : std::runtime_error(msg) {} };
+class RegistrationICPError : public std::runtime_error { public: explicit RegistrationICPError(const std::string& msg) : std::runtime_error(msg) {} };
 
 }

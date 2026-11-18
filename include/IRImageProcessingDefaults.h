@@ -6,7 +6,7 @@
 using namespace IRTools::ImageProcessing;
 
 const RegistrationSettings LJS8DefaultSettings = {
-    .type = LJS8_LASER,
+    .device_type = DT_LJS8_LASER,
 
     .device_settings = LJS8Settings{
         .x_raw_pixel_spacing = 50,
