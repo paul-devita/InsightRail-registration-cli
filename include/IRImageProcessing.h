@@ -112,7 +112,7 @@ geo::PointCloud smoothSingleCloud(const geo::PointCloud& source, uint32_t size, 
 RegistrationResult registerSingleCloud(const RegistrationInput& input, RegistrationSettings& settings);
 
 
-class RegistrationLJS8SettingsError : public std::runtime_error { public: explicit RegistrationLJS8SettingsError(const std::string& msg) : std::runtime_error(msg) {} };
+class RegistrationSettingsError : public std::runtime_error { public: explicit RegistrationSettingsError(const std::string& msg) : std::runtime_error(msg) {} };
 class RegistrationLJS8DataError : public std::runtime_error { public: explicit RegistrationLJS8DataError(const std::string& msg) : std::runtime_error(msg) {} };
 class RegistrationInputError : public std::runtime_error { public: explicit RegistrationInputError(const std::string& msg) : std::runtime_error(msg) {} };
 class RegistrationICPError : public std::runtime_error { public: explicit RegistrationICPError(const std::string& msg) : std::runtime_error(msg) {} };

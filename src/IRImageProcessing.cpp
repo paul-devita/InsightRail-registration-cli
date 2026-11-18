@@ -42,8 +42,43 @@ namespace {
     };
 }
 
+/**
+ * @brief Checks every setting value
+ *
+ * @exception RegistrationSettingsError Thrown when settings are invalid in any way,
+ * which includes but is not limited to non-finite/NaN values, values outside of a given range, missing values.
+ *
+ * @param[in] settings The settings to be checked and verified
+ * */
 static void verifyRegistrationSettings(const RegistrationSettings& settings);
+
+/**
+ * @brief Converts the data received from an LJS8 Laser to an Open3D point cloud of Eigen::Vector3d
+ *
+ * @exception RegistrationLJS8DataError Thrown when the input tiff cannot be read, when tiff dimensions are invalid, or when
+ * the function fails to construct/allocate the resulting point cloud.
+ *
+ * @param[in] fp String filepath pointing to the input tiff file.
+ * @param[in] settings Settings utilized to select device type. Device settings are used to verify that the correct device input is being accessed.
+ *
+ * @return A RegistrationLjs8PointCloud structure containing:
+ * - 'cloud': Open3D point cloud populated with 3D point vectors
+ * - 'width': Width of the grid, in pixels. Guaranteed to be non-zero.
+ * - 'height': Height of the grid, in pixels. Guaranteed to be non-zero.
+ */
 static RegistrationLjs8PointCloud ljs8DataToPointCloud(const std::string& fp, const LJS8Settings& settings);
+
+/**
+ * @brief Utilizes Iterative Closest Point (ICP) to align two point clouds. Iterates from smaller, more downsampled point
+ * clouds to larger, higher-resolution point clouds, improving the transformation estimate at each level.
+ *
+ * @param t Starting 4x4 transformation matrix.
+ * @param src_levels Vector of downsampled source point clouds.
+ * @param ref_levels Vector of downsampled reference point clouds.
+ * @param settings Settings utilized during the transformation.
+ *
+ * @return An Eigen::Matrix4d representing the new estimated transform as a result of ICP.
+ */
 static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>& src_levels, const std::vector<PointCloudSP>& ref_levels, const RegistrationSettings& settings);
 static Mat4d globalTransformRANSAC(const PointCloudSP& source, const PointCloudSP& target, const RegistrationSettings& settings);
 static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source, const PointCloudSP& reference, const RegistrationSettings& settings);
@@ -70,6 +105,10 @@ PointCloud IRTools::ImageProcessing::smoothSingleCloud(const geo::PointCloud& so
 }
 
 RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const RegistrationInput& input, RegistrationSettings& settings) {
+    // first verify settings
+    verifyRegistrationSettings(settings);
+
+    // get device type, designate the source and reference point clouds, and designate grid specifications
     const DeviceType dt = settings.device_type;
     PointCloud source_pc, reference_pc;
     RegistrationGridSpec grid_spec{};
@@ -82,6 +121,10 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
         case DT_LJS8_LASER: {
             // get the laser-specific settings from RegistrationSettings
             const LJS8Settings& ljs8_settings = std::get<LJS8Settings>(settings.device_settings);
+
+            // verify and retrieve the ljs8 input
+            if (!std::holds_alternative<LJS8Input>(input))
+                throw RegistrationLJS8DataError("invalid input type for LJS8 data input");
             const auto& ljs8_input = std::get<LJS8Input>(input);
 
             // save each point cloud
@@ -93,24 +136,19 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
                 throw RegistrationInputError("source and reference grids have different dimensions");
             }
 
-            // populate the grid specification
+            // populate the grid specification, each is verified to be non-zero
             grid_spec.width = reference_width;
             grid_spec.height = reference_height;
-            grid_spec.x_pixel_spacing = ljs8_settings.lx_skip * ljs8_settings.ux_skip * ljs8_settings.x_raw_pixel_spacing;
-            grid_spec.y_pixel_spacing = ljs8_settings.ly_skip * ljs8_settings.uy_skip * ljs8_settings.y_raw_pixel_spacing;
+            // conversion from uint8_t to double will never produce NaN, pixel spacings are verified before to not be NaN, so values only need to be checked for non-finite values
+            grid_spec.x_pixel_spacing = static_cast<double>(ljs8_settings.lx_skip) * static_cast<double>(ljs8_settings.ux_skip) * ljs8_settings.x_raw_pixel_spacing;
+            grid_spec.y_pixel_spacing = static_cast<double>(ljs8_settings.ly_skip) * static_cast<double>(ljs8_settings.uy_skip) * ljs8_settings.y_raw_pixel_spacing;
 
             // ensure that the pixel spacing is valid
             if (grid_spec.x_pixel_spacing < 0 || grid_spec.y_pixel_spacing < 0) {
                 throw RegistrationInputError("invalid negative pixel spacing");
             }
-            if (Eigen::internal::isApprox(grid_spec.x_pixel_spacing, 0.0) ||
-            Eigen::internal::isApprox(grid_spec.y_pixel_spacing, 0.0)) {
+            if (Eigen::internal::isApprox(grid_spec.x_pixel_spacing, 0.0) || Eigen::internal::isApprox(grid_spec.y_pixel_spacing, 0.0)) {
                 throw RegistrationInputError("invalid zero pixel spacing");
-            }
-
-            // ensure that the width and height are valid
-            if (grid_spec.width == 0 || grid_spec.height == 0) {
-                throw RegistrationInputError("invalid zero pixel grid dimensions");
             }
 
             // update the settings pixel spacing to match
@@ -261,13 +299,13 @@ static void verifyRegistrationSettings(const RegistrationSettings& settings) {
 
     const auto verifyNegZeroFiniteNan = [](const double val, const std::string& name) -> void {
         if (val < 0.0)
-            throw RegistrationLJS8SettingsError("invalid value: invalid negative " + name);
+            throw RegistrationSettingsError("invalid value: invalid negative " + name);
         if (Eigen::internal::isApprox(val, 0.0))
-            throw RegistrationLJS8SettingsError("invalid value: invalid zero " + name);
+            throw RegistrationSettingsError("invalid value: invalid zero " + name);
         if (!std::isfinite(val))
-            throw RegistrationLJS8SettingsError("invalid value: " + name + " is non-finite");
+            throw RegistrationSettingsError("invalid value: " + name + " is non-finite");
         if (std::isnan(val))
-            throw RegistrationLJS8SettingsError("invalid value: " + name + " is nan");
+            throw RegistrationSettingsError("invalid value: " + name + " is nan");
     };
 
     // verify device settings
@@ -275,7 +313,7 @@ static void verifyRegistrationSettings(const RegistrationSettings& settings) {
         case DT_LJS8_LASER: {
             // verify device_settings type
             if (!std::holds_alternative<LJS8Settings>(s.device_settings))
-                throw RegistrationLJS8SettingsError("LJS8 SETTINGS ERROR: invalid settings type for DT_LJS8_LASER");
+                throw RegistrationSettingsError("LJS8 SETTINGS ERROR: invalid settings type for DT_LJS8_LASER");
 
             // get reference to the device_settings
             const auto& ds = std::get<LJS8Settings>(s.device_settings);
@@ -286,25 +324,25 @@ static void verifyRegistrationSettings(const RegistrationSettings& settings) {
 
             // verify skipping
             if (ds.lx_skip == 0 || ds.ly_skip == 0 || ds.ux_skip == 0 || ds.uy_skip == 0)
-                throw RegistrationLJS8SettingsError("LJS8 SETTINGS ERROR: invalid skipping");
+                throw RegistrationSettingsError("LJS8 SETTINGS ERROR: invalid skipping");
 
             // verify height_zero
-            IRTOOLS_IP_VERIFY_FINITE(ds.height_zero, RegistrationLJS8SettingsError);
-            IRTOOLS_IP_VERIFY_NAN(ds.height_zero, RegistrationLJS8SettingsError);
+            IRTOOLS_IP_VERIFY_FINITE(ds.height_zero, RegistrationSettingsError);
+            IRTOOLS_IP_VERIFY_NAN(ds.height_zero, RegistrationSettingsError);
 
             // verify height_scale
             if (Eigen::internal::isApprox(ds.height_scale, 0.0))
-                throw RegistrationLJS8SettingsError("LJS8 SETTINGS ERROR: invalid height scale");
-            IRTOOLS_IP_VERIFY_FINITE(ds.height_scale, RegistrationLJS8SettingsError);
-            IRTOOLS_IP_VERIFY_NAN(ds.height_scale, RegistrationLJS8SettingsError);
+                throw RegistrationSettingsError("LJS8 SETTINGS ERROR: invalid height scale");
+            IRTOOLS_IP_VERIFY_FINITE(ds.height_scale, RegistrationSettingsError);
+            IRTOOLS_IP_VERIFY_NAN(ds.height_scale, RegistrationSettingsError);
         }
         default:
-            throw RegistrationLJS8SettingsError("invalid device type");
+            throw RegistrationSettingsError("invalid device type");
     }
 
     // verify levels
     if (s.levels.empty())
-        throw RegistrationLJS8SettingsError("no levels provided");
+        throw RegistrationSettingsError("no levels provided");
     for (size_t i = 0; i < s.levels.size(); i++) {
         const auto&[voxel_size, correspondence_distance, max_iterations] = s.levels.at(i);
 
@@ -316,20 +354,20 @@ static void verifyRegistrationSettings(const RegistrationSettings& settings) {
 
         // verify max_iterations
         if (max_iterations == 0)
-            throw RegistrationLJS8SettingsError("invalid zero max iterations for level " + std::to_string(i));
+            throw RegistrationSettingsError("invalid zero max iterations for level " + std::to_string(i));
     }
 
     // verify relative_fitness
     if (s.relative_fitness < 0.0)
-        throw RegistrationLJS8SettingsError("invalid relative_fitness value (must be non-negative)");
-    IRTOOLS_IP_VERIFY_FINITE(s.relative_fitness, RegistrationLJS8SettingsError);
-    IRTOOLS_IP_VERIFY_NAN(s.relative_fitness, RegistrationLJS8SettingsError);
+        throw RegistrationSettingsError("invalid relative_fitness value (must be non-negative)");
+    IRTOOLS_IP_VERIFY_FINITE(s.relative_fitness, RegistrationSettingsError);
+    IRTOOLS_IP_VERIFY_NAN(s.relative_fitness, RegistrationSettingsError);
 
     // verify relative_rmse
     if (s.relative_rmse < 0.0)
-        throw RegistrationLJS8SettingsError("invalid relative_fitness value (must be non-negative)");
-    IRTOOLS_IP_VERIFY_FINITE(s.relative_rmse, RegistrationLJS8SettingsError);
-    IRTOOLS_IP_VERIFY_NAN(s.relative_rmse, RegistrationLJS8SettingsError);
+        throw RegistrationSettingsError("invalid relative_fitness value (must be non-negative)");
+    IRTOOLS_IP_VERIFY_FINITE(s.relative_rmse, RegistrationSettingsError);
+    IRTOOLS_IP_VERIFY_NAN(s.relative_rmse, RegistrationSettingsError);
 
     // verify normal_radius_factor
     verifyNegZeroFiniteNan(s.normal_radius_factor, "normal_radius_factor");
@@ -343,15 +381,15 @@ static void verifyRegistrationSettings(const RegistrationSettings& settings) {
 
     // verify ransac_confidence
     if (s.ransac_confidence <= 0.0 || s.ransac_confidence > 1.0)
-        throw RegistrationLJS8SettingsError("ransac confidence must be greater than zero and at most 1");
-    IRTOOLS_IP_VERIFY_FINITE(s.ransac_confidence, RegistrationLJS8SettingsError);
-    IRTOOLS_IP_VERIFY_NAN(s.ransac_confidence, RegistrationLJS8SettingsError);
+        throw RegistrationSettingsError("ransac confidence must be greater than zero and at most 1");
+    IRTOOLS_IP_VERIFY_FINITE(s.ransac_confidence, RegistrationSettingsError);
+    IRTOOLS_IP_VERIFY_NAN(s.ransac_confidence, RegistrationSettingsError);
 
     // verify min_fitness
     if (s.min_fitness <= 0.0 || s.min_fitness >= 1.0)
-        throw RegistrationLJS8SettingsError("invalid min_fitness value (must be strictly between 0 and 1)");
-    IRTOOLS_IP_VERIFY_FINITE(s.min_fitness, RegistrationLJS8SettingsError);
-    IRTOOLS_IP_VERIFY_NAN(s.min_fitness, RegistrationLJS8SettingsError);
+        throw RegistrationSettingsError("invalid min_fitness value (must be strictly between 0 and 1)");
+    IRTOOLS_IP_VERIFY_FINITE(s.min_fitness, RegistrationSettingsError);
+    IRTOOLS_IP_VERIFY_NAN(s.min_fitness, RegistrationSettingsError);
 
     // verify max_plane_rmse
     verifyNegZeroFiniteNan(s.max_plane_rmse, "max_plane_rmse");
@@ -364,17 +402,17 @@ static void verifyRegistrationSettings(const RegistrationSettings& settings) {
 
     // verify min_constraint_ratio
     if (s.min_constraint_ratio <= 0.0 || s.min_constraint_ratio >= 1.0)
-        throw RegistrationLJS8SettingsError("invalid min_constraint_ratio value (must be strictly between 0 and 1)");
-    IRTOOLS_IP_VERIFY_FINITE(s.min_constraint_ratio, RegistrationLJS8SettingsError);
-    IRTOOLS_IP_VERIFY_NAN(s.min_constraint_ratio, RegistrationLJS8SettingsError);
+        throw RegistrationSettingsError("invalid min_constraint_ratio value (must be strictly between 0 and 1)");
+    IRTOOLS_IP_VERIFY_FINITE(s.min_constraint_ratio, RegistrationSettingsError);
+    IRTOOLS_IP_VERIFY_NAN(s.min_constraint_ratio, RegistrationSettingsError);
 
     // verify global mode
     if (s.global_mode < 0 || s.global_mode >= RGM_COUNT)
-        throw RegistrationLJS8SettingsError("invalid global mode");
+        throw RegistrationSettingsError("invalid global mode");
 
     // verify interpolation mode
     if (s.interpolation_mode < 0 || s.interpolation_mode >= RIM_COUNT)
-        throw RegistrationLJS8SettingsError("invalid interpolation mode");
+        throw RegistrationSettingsError("invalid interpolation mode");
 }
 
 static RegistrationLjs8PointCloud ljs8DataToPointCloud(const std::string& fp, const LJS8Settings& settings)
