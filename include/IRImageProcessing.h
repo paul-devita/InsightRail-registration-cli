@@ -101,7 +101,7 @@ using RegistrationInput = std::variant<LJS8Input>;
 struct RegistrationResult {
     std::unique_ptr<double[]> heights;
     std::unique_ptr<uint8_t[]> luminance;
-    std::unique_ptr<uint8_t[]> valid_bitmap;
+    std::unique_ptr<bool[]> valid_map;
     uint32_t width;
     uint32_t height;
     bool luminance_valid;
@@ -116,5 +116,6 @@ class RegistrationSettingsError : public std::runtime_error { public: explicit R
 class RegistrationLJS8DataError : public std::runtime_error { public: explicit RegistrationLJS8DataError(const std::string& msg) : std::runtime_error(msg) {} };
 class RegistrationInputError : public std::runtime_error { public: explicit RegistrationInputError(const std::string& msg) : std::runtime_error(msg) {} };
 class RegistrationICPError : public std::runtime_error { public: explicit RegistrationICPError(const std::string& msg) : std::runtime_error(msg) {} };
+class RegistrationCheckICPFailure : public std::runtime_error { public: explicit RegistrationCheckICPFailure(const std::string& msg) : std::runtime_error(msg) {} };
 
 }

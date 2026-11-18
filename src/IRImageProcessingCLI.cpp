@@ -435,8 +435,7 @@ void printSettings(const RegistrationSettings& settings_, std::ostream& out) {
     row("Relative fitness", settings_.relative_fitness);
     row("Relative RMSE", settings_.relative_rmse);
     row("Normal radius factor", settings_.normal_radius_factor);
-    row("Robust loss enabled", settings_.loss_enabled);
-    row("Robust scale", settings_.robust_scale);
+    row("Robust scale", (settings_.robust_scale == std::nullopt ? 0.0 : settings_.robust_scale.value()));
 
     text << "\nGlobal registration\n";
     row("Global voxel size", settings_.global_voxel_size);

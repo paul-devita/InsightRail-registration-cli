@@ -29,7 +29,7 @@ namespace {
 
     struct RegistrationLuminanceData {
         const uint8_t* data;
-        const uint8_t* valid_map;
+        const bool* valid_map;
         uint32_t width;
         uint32_t height;
         bool valid;
@@ -45,21 +45,21 @@ namespace {
 /**
  * @brief Checks every setting value
  *
- * @exception RegistrationSettingsError Thrown when settings are invalid in any way,
- * which includes but is not limited to non-finite/NaN values, values outside of a given range, missing values.
- *
  * @param[in] settings The settings to be checked and verified
+ *
+ * @exception RegistrationSettingsError Thrown when settings are invalid in any way,
+ * which includes but is not limited to non-finite/NaN values, values outside a given range, missing values.
  * */
 static void verifyRegistrationSettings(const RegistrationSettings& settings);
 
 /**
  * @brief Converts the data received from an LJS8 Laser to an Open3D point cloud of Eigen::Vector3d
  *
- * @exception RegistrationLJS8DataError Thrown when the input tiff cannot be read, when tiff dimensions are invalid, or when
- * the function fails to construct/allocate the resulting point cloud.
- *
  * @param[in] fp String filepath pointing to the input tiff file.
  * @param[in] settings Settings utilized to select device type. Device settings are used to verify that the correct device input is being accessed.
+ *
+ * @exception RegistrationLJS8DataError Thrown when the input tiff cannot be read, when tiff dimensions are invalid, or when
+ * the function fails to construct/allocate the resulting point cloud.
  *
  * @return A RegistrationLjs8PointCloud structure containing:
  * - 'cloud': Open3D point cloud populated with 3D point vectors
@@ -77,11 +77,30 @@ static RegistrationLjs8PointCloud ljs8DataToPointCloud(const std::string& fp, co
  * @param ref_levels Vector of downsampled reference point clouds.
  * @param settings Settings utilized during the transformation.
  *
+ * @exception RegistrationICPError Thrown when the ICP result fails validation.
+ * @exception RegistrationCheckICPFailure Thrown when a failure occurs when checking the ICP transformation result.
+ *
  * @return An Eigen::Matrix4d representing the new estimated transform as a result of ICP.
  */
 static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>& src_levels, const std::vector<PointCloudSP>& ref_levels, const RegistrationSettings& settings);
+
+
 static Mat4d globalTransformRANSAC(const PointCloudSP& source, const PointCloudSP& target, const RegistrationSettings& settings);
+
+/**
+ * @brief Verifies the transformation generated via ICP, throwing exceptions to indicate that the transformation does not meet the standards/thresholds specified in settings
+ *
+ * @param transform Transform generated during ICP that will be verified.
+ * @param source Source point cloud used to generate the transform.
+ * @param reference Reference point cloud used to generate the transform.
+ * @param settings Settings that dictate the metrics/thresholds at which the transformation will be verified.
+ *
+ * @exception RegistrationICPError Thrown when the ICP result fails validation.
+ * @exception RegistrationCheckICPFailure Thrown when a failure occurs when checking the ICP transformation result.
+ */
 static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source, const PointCloudSP& reference, const RegistrationSettings& settings);
+
+
 static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transform, const RegistrationGridSpec& grid_spec, const RegistrationLuminanceData& luminance_data);
 
 PointCloud IRTools::ImageProcessing::smoothSingleCloud(const geo::PointCloud& source, const uint32_t size, const uint32_t sigma) {
@@ -170,15 +189,13 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
             throw RegistrationInputError("invalid device type");
     }
 
-    constexpr uint32_t MAX_NN_NORMALS = 30;
-
-    // must be vector of shared_ptr, prevents unnecessary copying of point cloud data
-    std::vector<PointCloudSP> src_levels, ref_levels;
-
-    // if there are no voxel sizes provided, use full point clouds for registration
+    // must provide voxel levels
     if (settings.levels.empty()) {
         throw RegistrationInputError("invalid voxel levels (levels list is empty)");
     }
+
+    // must be a vector of shared_ptr, prevents unnecessary copying of point cloud data
+    std::vector<PointCloudSP> src_levels, ref_levels;
 
     // process voxel levels for registration
     const size_t voxel_count = settings.levels.size();
@@ -189,11 +206,14 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
 
     // function for a thread to execute, updates the ith element in either levels list
     const auto processLevel = [](std::vector<PointCloudSP>& dest, const size_t i, const float voxel, const float radius_factor, const PointCloud& original_cloud,
-        const uint32_t iterations, const bool is_ref) -> void {
+        const uint32_t neighbors, const bool is_ref) -> void {
         /* Assumptions about input, verified by previous checks:
-         *  dest    - allocated with resize, allocation is always successful when program reaches this point
-         *  i       - always ranged between 0 and voxel_count, dest is always resized using voxel_count
-         *  voxel   - verified with check at start of loop
+         *  dest        - allocated with resize, allocation is always successful when program reaches this point
+         *  i           - always ranged between 0 and voxel_count, dest is always resized using voxel_count
+         *  voxel       - verified with settings verification function
+         *  radius      - verified with settings verification function
+         *  original    - verified with raw data to point cloud function
+         *  iterations  - verified with settings verification function
          */
 
         DEBUG_LOG("REG: estimating normals for " << (is_ref ? "reference" : "source") << " level " << i << " at voxel scale " << voxel);
@@ -202,7 +222,7 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
         const PointCloudSP downsampled = original_cloud.VoxelDownSample(voxel);
 
         // estimate the normals for the downsampled point cloud
-        downsampled->EstimateNormals(KDSearchParam(voxel * radius_factor, static_cast<int>(iterations)), true);
+        downsampled->EstimateNormals(KDSearchParam(voxel * radius_factor, static_cast<int>(neighbors)), true);
 
         // set the designated index in the list to be the updated point cloud
         dest.at(i) = downsampled;
@@ -210,12 +230,11 @@ RegistrationResult IRTools::ImageProcessing::registerSingleCloud(const Registrat
 
     // for each voxel size, generate a point cloud and add it to the list, in order
     for (size_t i = 0; i < voxel_count; i++) {
-        const double voxel = settings.levels.at(i).voxel_size;
+        // maximum number of neighbors to sample for normal estimation
+        constexpr uint32_t MAX_NN_NORMALS = 30;
 
-        // check voxel size
-        if (voxel <= 0) {
-            throw RegistrationInputError("invalid voxel size for level " + std::to_string(i));
-        }
+        // the voxel size at this level
+        const double voxel = settings.levels.at(i).voxel_size;
 
         // spawn thread for processing the source point cloud at the current voxel level
         DEBUG_LOG("REG: spawning thread to process source level " << i << " with voxel scale " << voxel);
@@ -335,6 +354,8 @@ static void verifyRegistrationSettings(const RegistrationSettings& settings) {
                 throw RegistrationSettingsError("LJS8 SETTINGS ERROR: invalid height scale");
             IRTOOLS_IP_VERIFY_FINITE(ds.height_scale, RegistrationSettingsError);
             IRTOOLS_IP_VERIFY_NAN(ds.height_scale, RegistrationSettingsError);
+
+            break;
         }
         default:
             throw RegistrationSettingsError("invalid device type");
@@ -485,9 +506,6 @@ static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>&
         throw RegistrationICPError("invalid levels vectors");
     }
 
-    // amount of levels to be processed
-    const size_t len = src_levels.size();
-
     // estimator to be utilized
     const auto estimator = settings.robust_scale != std::nullopt ?
         reg::TransformationEstimationPointToPlane(std::make_shared<reg::HuberLoss>(reg::HuberLoss(settings.robust_scale.value())))
@@ -498,7 +516,7 @@ static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>&
     Mat4d transform = t;
 
     // iterate over each level, refining the transformation with each iteration
-    for (size_t i = 0; i < len; i++) {
+    for (size_t i = 0; i < src_levels.size(); i++) {
         // correspondence distance
         const auto cd = settings.levels.at(i).correspondence_distance;
 
@@ -510,14 +528,14 @@ static Mat4d refineTransformICP(const Mat4d& t, const std::vector<PointCloudSP>&
         );
 
         // source and target point cloud at this level
-        const auto& src = *src_levels.at(i);
-        const auto& ref = *ref_levels.at(i);
+        const auto& source = *src_levels.at(i);
+        const auto& reference = *ref_levels.at(i);
 
         // perform ICP to get transform
         DEBUG_LOG("ICP: running RegistrationICP for level " << i);
         const reg::RegistrationResult res = reg::RegistrationICP(
-            src,
-            ref,
+            source,
+            reference,
             cd,
             transform,
             estimator,
@@ -597,7 +615,7 @@ static Mat4d globalTransformRANSAC(const PointCloudSP& source, const PointCloudS
             std::cref(edge_checker),
             std::cref(distance_checker)
         }),
-        ConvergenceCriteria(settings.ransac_iterations, settings.ransac_confidence)
+        ConvergenceCriteria(static_cast<int>(settings.ransac_iterations), settings.ransac_confidence)
     );
 
     // todo: add throw for res.correspondence_set < 3
@@ -617,12 +635,19 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
 
     // initialize the transformed coordinates vector
     std::vector<Eigen::Vector3d> moved;
-    moved.reserve(points.size());
+    try {
+        moved.reserve(points.size());
+    }
+    catch (const std::exception& e) {
+        throw RegistrationCheckICPFailure("failed to construct transformed points list: " + std::string(e.what()));
+    }
 
     // process at most 100,000 points from the point cloud
     constexpr size_t MAX_SAMPLE_COUNT = 100000;
-    const size_t sample_count = (std::min)(points.size(), MAX_SAMPLE_COUNT); // amount of samples to be processed
-    const double step = sample_count > 1 // constant step to get index within the points vector
+    // amount of samples to be processed
+    const size_t sample_count = (std::min)(points.size(), MAX_SAMPLE_COUNT);
+    // constant step to get index within the points vector
+    const double step = sample_count > 1
         ? (static_cast<double>(points.size()) - 1) / static_cast<double>(sample_count - 1)
         : 0;
 
@@ -648,25 +673,40 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     // initialize the indices and distances vectors
     struct ValidTransformedPoint {
         Eigen::Vector3d point;
-        size_t tgt_index; // index wrt target point cloud of the closest point by euclidean distance
-        double distance; // actual euclidean distance between the closest point in target and this point
+        size_t tgt_index; // index wrt target point cloud of the closest point by Euclidean distance
+        double distance; // actual Euclidean distance between the closest point in target and this point
     };
 
     // valid points within the provided correspondence distance
     std::vector<ValidTransformedPoint> valid_points;
-    valid_points.reserve(moved.size());
+    try {
+        valid_points.reserve(moved.size());
+    }
+    catch (const std::runtime_error& e) {
+        throw RegistrationCheckICPFailure("failed to construct valid points list: " + std::string(e.what()));
+    }
 
     // squared sum of how far a transformed point lies along the reference surface's normal direction
     double residual2_sum = 0.0;
 
     // values used for metric calculations
+
+    // center of the point cloud
     const Eigen::Vector3d center = (reference->GetMinBound() + reference->GetMaxBound()) / 2.0;
+    // how much the transformation moves that center point
     const Eigen::Vector3d shift = rotation * center + translation - center;
+
     const Eigen::AngleAxisd angle_axis(rotation);
+    // angle of the rotation, in degrees
     const double angle_degrees = angle_axis.angle() * 180.0 / std::numbers::pi;
+
+    // the bounding box, representing the minimum and maximum xyz coordinates
     const Eigen::Vector3d dimensions = (reference->GetMaxBound() - reference->GetMinBound());
+    // the diagonal length of the bounding box
     const double size = (std::max)(dimensions.norm(), std::numeric_limits<double>::epsilon());
+    // represents how well the transformation constrains the six possible motions of a rigid transformation (i.e. translation on x, y, and z and rotation on x, y, and z)
     Eigen::Matrix<double, 6, 6> constraint_matrix = Eigen::Matrix<double, 6, 6>::Zero();
+
 
     // construct the KD-tree from the target point cloud
     geo::KDTreeFlann tree(*reference);
@@ -684,12 +724,18 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
             nn_distances_squared
         );
 
+        // if we find a point
         if (found > 0) {
+            // the non-squared distance of the closest point
             const double nn_distance = std::sqrt(nn_distances_squared.at(0));
 
+            // ensure that the point found is within our correspondence distance threshold
             if (nn_distance <= min_correspondence_distance) {
-                const size_t ref_index = nn_indices.at(0); // index of the closest reference point
+                // index of the closest reference point
+                const size_t ref_index = nn_indices.at(0);
+                // the normal of the reference point
                 const Eigen::Vector3d& ref_normal = reference->normals_.at(ref_index);
+                // the reference point
                 const Eigen::Vector3d& ref_point = reference->points_.at(ref_index);
 
                 ValidTransformedPoint vtp{};
@@ -701,7 +747,8 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
 
                 // calculate residual
                 const double residual = (p - ref_point).dot(ref_normal);
-                residual2_sum += residual * residual; // add the square the of the residual to the sum
+                // add the square the of the residual to the sum
+                residual2_sum += residual * residual;
 
                 // accumulate constraint matrix
                 const Eigen::Vector3d centered_normalized = (p - center) / size;
@@ -718,7 +765,7 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     }
 
     // amount of points with a valid correspondence
-    const size_t count = valid_points.size();
+    const size_t valid_point_count = valid_points.size();
 
     // flag to indicate that an error was generated
     bool should_throw = false;
@@ -729,22 +776,27 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     // metrics to determine the success of ICP
     DEBUG_LOG("CHECK ICP: calcualting ICP checking metrics");
     constexpr uint32_t MIN_POINT_COUNT = 30;
-    const double fitness = sample_count > 0 // proportion of samples that have a valid correspondence
-        ? static_cast<double>(count) / static_cast<double>(sample_count)
+    // proportion of samples that have a valid correspondence
+    const double fitness = sample_count > 0
+        ? static_cast<double>(valid_point_count) / static_cast<double>(sample_count)
         : 0;
-    const double center_shift_length = shift.norm(); // normalized length of the shift
-    double plane_rmse = sample_count > 0 // point-to-plane root mean squared error
-        ? std::sqrt(residual2_sum / static_cast<double>(count))
+    // normalized length of the shift
+    const double center_shift_length = shift.norm();
+    // point-to-plane root mean squared error
+    double plane_rmse = sample_count > 0
+        ? std::sqrt(residual2_sum / static_cast<double>(valid_point_count))
         : 0.0;
-    double constrain_ratio; // how well correspondences constrain the six degrees of freedom of the estimated rigid transformation
+    // how well correspondences constrain the six degrees of freedom of the estimated rigid transformation
+    double constrain_ratio;
     {
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(
             constraint_matrix,
             Eigen::EigenvaluesOnly
         );
 
+        // report failure if decomposition fails
         if (solver.info() != Eigen::Success) {
-            throw std::runtime_error("eigenvalue decomposition failed");
+            throw RegistrationCheckICPFailure("eigenvalue decomposition failed");
         }
 
         const auto eigen_values = solver.eigenvalues();
@@ -754,7 +806,7 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
     }
 
     // check each metrix to ensure ICP effectiveness
-    if (count < MIN_POINT_COUNT) {
+    if (valid_point_count < MIN_POINT_COUNT) {
         const std::string MSG = "too few correspondences";
         should_throw = true;
         errors += errors.empty()
@@ -799,26 +851,7 @@ static void checkIcpTransform(const Mat4d& transform, const PointCloudSP& source
 
     // if we encounter any ICP errors, throw with the appropriate message
     if (should_throw)
-        throw std::runtime_error(errors.c_str());
-}
-
-// returns true if the ith bit is set, false otherwise
-static bool checkBitmapIndex(const size_t i, const uint8_t* const bitmap) {
-    const size_t byte = i / 8;
-    const size_t bit = i % 8;
-
-    const uint8_t val = bitmap[byte] & (1u << bit);
-
-    return val > 0;
-}
-
-static void setBitmapIndex(const size_t i, const bool val, uint8_t* const bitmap) {
-    const size_t byte = i / 8;
-    const size_t bit = i % 8;
-
-    bitmap[byte] = val
-        ? bitmap[byte] | (1u << bit)
-        : bitmap[byte] & ~(1u << bit);
+        throw RegistrationICPError(errors);
 }
 
 // todo: make a copy of the data to find median, moves normals
@@ -855,14 +888,14 @@ static double pointCloudMedian(PointCloud& pc) {
         points.begin(),
         points.begin() + mid,
         compare
-    )._Unwrapped()->z();
+    )->z();
 
     // calculate the average between the two values
     return (lower + upper) / 2.0;
 }
 
 template <typename T>
-static T bilinearInterpolation(const T* const source, const uint8_t* const bitmap, const Eigen::Vector2d& uv, const RegistrationGridSpec& grid_spec, const T fill) {
+static T bilinearInterpolation(const T* const source, const bool* const valid_map, const Eigen::Vector2d& uv, const RegistrationGridSpec& grid_spec, const T fill) {
     const double& x = uv.x();
     const double& y = uv.y();
 
@@ -874,6 +907,7 @@ static T bilinearInterpolation(const T* const source, const uint8_t* const bitma
     const double alpha = x - std::floor(x);
     const double beta = y - std::floor(y);
 
+    // calculate the bilinear weights
     const double w00 = (1.0 - alpha) * (1.0 - beta);
     const double w01 = alpha * (1.0 - beta);
     const double w10 = (1.0 - alpha) * beta;
@@ -891,10 +925,10 @@ static T bilinearInterpolation(const T* const source, const uint8_t* const bitma
     const size_t i11 = yhi * grid_spec.width + xhi;
 
     // get valid values
-    const bool v00 = checkBitmapIndex(i00, bitmap);
-    const bool v01 = checkBitmapIndex(i01, bitmap);
-    const bool v10 = checkBitmapIndex(i10, bitmap);
-    const bool v11 = checkBitmapIndex(i11, bitmap);
+    const bool v00 = valid_map[i00];
+    const bool v01 = valid_map[i01];
+    const bool v10 = valid_map[i10];
+    const bool v11 = valid_map[i11];
 
     // get z values
     const T z00 = v00 ? source[i00] : fill;
@@ -922,7 +956,7 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
     result.height = height;
     result.width = width;
     result.heights = std::make_unique<double[]>(size);
-    result.valid_bitmap = std::make_unique<uint8_t[]>((size - 1) / 8 + 1);
+    result.valid_map = std::make_unique<bool[]>(size);
     result.luminance = luminance_data.valid
         ? std::make_unique<uint8_t[]>(size)
         : std::unique_ptr<uint8_t[]>();
@@ -935,7 +969,7 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
 
     // create source grid and bitmap
     const auto source_grid = std::make_unique<double[]>(size);
-    const auto source_bitmap = std::make_unique<uint8_t[]>((size - 1) / 8 + 1);
+    const auto source_bitmap = std::make_unique<bool[]>(size);
 
     // reconstruct original grid and bitmap
     for (const Eigen::Vector3d& p : source.points_) {
@@ -959,14 +993,14 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
         }
 
         // ensure that the point is unique
-        if (checkBitmapIndex(i, source_bitmap.get())) {
+        if (source_bitmap[i] == true) {
             throw std::runtime_error("duplicate coordinate in point cloud"); // todo: create custom exception
         }
 
         // save the z value into that position in the grid
         source_grid[i] = z;
         // set the bitmap value
-        setBitmapIndex(i, true, source_bitmap.get());
+        source_bitmap[i] = true;
     }
     DEBUG_LOG("REGRID: reconstructed source grid and bitmap from original height data");
 
@@ -994,13 +1028,13 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
         for (size_t c = 0; c < width; c++) {
             constexpr size_t MAX_ESTIMATION_ITERATIONS = 30;
 
-            const uint32_t dx = grid_spec.x_pixel_spacing;
-            const uint32_t dy = grid_spec.y_pixel_spacing;
+            const double dx = grid_spec.x_pixel_spacing;
+            const double dy = grid_spec.y_pixel_spacing;
 
             // calculate the physical x and y coordinates from grid indices
             const Eigen::Vector2d xy_physical = {
-                c * dx,
-                r * dy
+                static_cast<double>(c) * dx,
+                static_cast<double>(r) * dy
             };
 
             // iteratively estimate the corresponding z value
@@ -1054,7 +1088,7 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
                 y >= 0.0 &&
                 y <= static_cast<double>(grid_spec.height - 1);
 
-            // proceed to checking only if the point is inside of the grid
+            // proceed to checking only if the point is inside the grid
             if (inside) {
                 // check to ensure that all four surrounding points are valid
                 const auto xlo = static_cast<size_t>(std::floor(x));
@@ -1069,10 +1103,10 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
                 const size_t i11 = yhi * grid_spec.width + xhi;
 
                 // ensure that every source pixel value is actually valid in the original grid
-                const bool v00 = checkBitmapIndex(i00, source_bitmap.get());
-                const bool v01 = checkBitmapIndex(i01, source_bitmap.get());
-                const bool v10 = checkBitmapIndex(i10, source_bitmap.get());
-                const bool v11 = checkBitmapIndex(i11, source_bitmap.get());
+                const bool v00 = source_bitmap[i00];
+                const bool v01 = source_bitmap[i01];
+                const bool v10 = source_bitmap[i10];
+                const bool v11 = source_bitmap[i11];
 
                 const double alpha = x - static_cast<double>(xlo);
                 const double beta = y - static_cast<double>(ylo);
@@ -1106,7 +1140,7 @@ static RegistrationResult regridHeight(PointCloud& source, const Mat4d& transfor
                     result.heights[index] = z_out;
 
                     // set the bit in the bitmap
-                    setBitmapIndex(index, true, result.valid_bitmap.get());
+                    result.valid_map[index] = true;
                 }
             }
 
