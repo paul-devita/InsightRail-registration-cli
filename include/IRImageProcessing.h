@@ -4,6 +4,8 @@
 #include <open3d/geometry/PointCloud.h>
 #include <open3d/pipelines/registration/Registration.h>
 
+#include <IRAtomicBitmap.h>
+
 #include <string>
 #include <vector>
 #include <variant>
@@ -41,11 +43,11 @@ enum RegistrationInterpolationMode {
     RIM_COUNT
 };
 
-enum DeviceType {
+enum RegistrationDeviceType {
     DT_LJS8_LASER
 };
 
-struct LJS8Settings {
+struct RegistrationLJS8DeviceSettings {
     double x_raw_pixel_spacing; // size of non-skipped pixel spacing in um
     double y_raw_pixel_spacing; // in other words, the highest image resolution possible
     uint8_t lx_skip;
@@ -57,7 +59,7 @@ struct LJS8Settings {
     std::vector<uint16_t> invalid_values;
 };
 
-using DeviceSettings =  std::variant<LJS8Settings>;
+using DeviceSettings =  std::variant<RegistrationLJS8DeviceSettings>;
 
 struct RegistrationLevelSettings {
     double voxel_size; // voxel sizes in um
@@ -65,8 +67,8 @@ struct RegistrationLevelSettings {
     uint16_t max_iterations;
 };
 
-struct RegistrationSettings { // todo: add mask?
-    DeviceType device_type;
+struct RegistrationSettings {
+    RegistrationDeviceType device_type;
     DeviceSettings device_settings;
     double x_pixel_size; // overwritten by device settings
     double y_pixel_size; // overwritten by device settings
@@ -74,7 +76,7 @@ struct RegistrationSettings { // todo: add mask?
     float relative_fitness;
     float relative_rmse;
     float normal_radius_factor;
-    std::optional<double> robust_scale; // loss
+    std::optional<double> robust_scale;
     float global_voxel_size;
     uint32_t ransac_iterations;
     float ransac_confidence;
@@ -98,14 +100,16 @@ struct LJS8Input {
 
 using RegistrationInput = std::variant<LJS8Input>;
 
-struct RegistrationResult {
+struct RegistrationLJS8Result {
     std::unique_ptr<double[]> heights;
     std::unique_ptr<uint8_t[]> luminance;
-    std::unique_ptr<bool[]> valid_map;
+    AtomicBitmap valid_map;
     uint32_t width;
     uint32_t height;
-    bool luminance_valid;
 };
+
+using RegistrationResult = std::variant<RegistrationLJS8Result>;
+
 
 geo::PointCloud smoothSingleCloud(const geo::PointCloud& source, uint32_t size, uint32_t sigma);
 
@@ -113,9 +117,18 @@ RegistrationResult registerSingleCloud(const RegistrationInput& input, Registrat
 
 
 class RegistrationSettingsError : public std::runtime_error { public: explicit RegistrationSettingsError(const std::string& msg) : std::runtime_error(msg) {} };
+
 class RegistrationLJS8DataError : public std::runtime_error { public: explicit RegistrationLJS8DataError(const std::string& msg) : std::runtime_error(msg) {} };
+
+class RegistrationDownsamplingError : public std::runtime_error { public: explicit RegistrationDownsamplingError(const std::string& msg) : std::runtime_error(msg) {} };
+
 class RegistrationInputError : public std::runtime_error { public: explicit RegistrationInputError(const std::string& msg) : std::runtime_error(msg) {} };
+
 class RegistrationICPError : public std::runtime_error { public: explicit RegistrationICPError(const std::string& msg) : std::runtime_error(msg) {} };
 class RegistrationCheckICPFailure : public std::runtime_error { public: explicit RegistrationCheckICPFailure(const std::string& msg) : std::runtime_error(msg) {} };
+
+class RegistrationRANSACError : public std::runtime_error { public: explicit RegistrationRANSACError(const std::string& msg) : std::runtime_error(msg) {} };
+
+class RegistrationRegridError : public std::runtime_error { public: explicit RegistrationRegridError(const std::string& msg) : std::runtime_error(msg) {} };
 
 }

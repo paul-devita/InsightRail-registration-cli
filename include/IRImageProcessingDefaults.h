@@ -8,7 +8,7 @@ using namespace IRTools::ImageProcessing;
 const RegistrationSettings LJS8DefaultSettings = {
     .device_type = DT_LJS8_LASER,
 
-    .device_settings = LJS8Settings{
+    .device_settings = RegistrationLJS8DeviceSettings{
         .x_raw_pixel_spacing = 50,
         .y_raw_pixel_spacing = 50,
         .lx_skip = 1,

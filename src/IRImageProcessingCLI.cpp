@@ -82,7 +82,7 @@ static void runCommand(const Command& command);
 
 static void printHelp(std::ostream& out = std::cout);
 static void printSettings(const RegistrationSettings& settings_, std::ostream& out = std::cout);
-static RegistrationResult registerSingle(std::string source, std::string reference, const std::optional<std::string>& luminance);
+static RegistrationLJS8Result registerSingle(std::string source, std::string reference, const std::optional<std::string>& luminance);
 static void testSingle(const std::string& reference);
 
 static IRTools::ImageProcessing::RegistrationSettings settings = LJS8DefaultSettings;
@@ -390,10 +390,10 @@ void printSettings(const RegistrationSettings& settings_, std::ostream& out) {
     text << "REGISTRATION SETTINGS\n\n";
 
     text << "Device\n";
-    if (settings_.device_type == DeviceType::DT_LJS8_LASER) {
+    if (settings_.device_type == RegistrationDeviceType::DT_LJS8_LASER) {
         row("Type", "LASER");
 
-        if (const auto* laser = std::get_if<LJS8Settings>(&settings_.device_settings)) {
+        if (const auto* laser = std::get_if<RegistrationLJS8DeviceSettings>(&settings_.device_settings)) {
             row("Raw X pixel spacing (um)", laser->x_raw_pixel_spacing);
             row("Raw Y pixel spacing (um)", laser->y_raw_pixel_spacing);
             row("Laser X skip", static_cast<unsigned>(laser->lx_skip));
@@ -458,7 +458,7 @@ void printSettings(const RegistrationSettings& settings_, std::ostream& out) {
     out << text.str();
 }
 
-static RegistrationResult registerSingle(std::string source, std::string reference, const std::optional<std::string>& luminance) {
+static RegistrationLJS8Result registerSingle(std::string source, std::string reference, const std::optional<std::string>& luminance) {
     LJS8Input input = {
         .source = std::move(source),
         .reference = std::move(reference),
@@ -507,8 +507,8 @@ void testSingle(const std::string &reference) {
     reference_data.valid_bitmap.resize(reference_data.width * reference_data.height);
 
     // get height scale and height zero
-    const double height_scale = std::get<IRTools::ImageProcessing::LJS8Settings>(settings.device_settings).height_scale;
-    const double height_zero = std::get<IRTools::ImageProcessing::LJS8Settings>(settings.device_settings).height_zero;
+    const double height_scale = std::get<IRTools::ImageProcessing::RegistrationLJS8DeviceSettings>(settings.device_settings).height_scale;
+    const double height_zero = std::get<IRTools::ImageProcessing::RegistrationLJS8DeviceSettings>(settings.device_settings).height_zero;
 
     // populate source bitmap and scaled data
     for (size_t i = 0; i < reference_data.width * reference_data.height; i++)
@@ -612,7 +612,7 @@ void testSingle(const std::string &reference) {
         // check each valid data point, taking note of any data points whose validness doesn't match
         for (size_t i = 0; i < size; i++) {
             const bool source_valid = reference_data.valid_bitmap.at(i);
-            const bool shifted_valid = checkBitmapIndex(i, result.valid_bitmap.get());
+            const bool shifted_valid = result.valid_bitmap.get();
 
             if (shifted_valid) {
                 const double shifted_scaled = result.heights[i];
